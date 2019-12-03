@@ -73,7 +73,6 @@ class PostgresqlEngine(Engine):
         self.connection.commit()
 
     def execute(self, query, args):
-        print(query, args)
         self.cur.execute(query, args)
         return self.cur
 
@@ -168,7 +167,6 @@ class DataMapperFactory:
 
     @classmethod
     def setup(cls, kind, table_name, db):
-        print(kind)
         if kind == SQLITE:
             return SQLiteDataMapper(table_name, db)
         elif kind == POSTGRESQL:
@@ -184,7 +182,6 @@ class Manager:
     def __init__(self, db: Database, model):
         self.model = model
         self.data_mapper = DataMapperFactory.setup(db.kind, table_name=model._table_name(), db=db)
-        print(self.data_mapper)
 
     def get(self, id):
         row = self.data_mapper.get(id)
