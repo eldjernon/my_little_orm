@@ -1,52 +1,133 @@
 from typing import Dict, Optional, Any
 import sqlite3
+import psycopg2
+import psycopg2.extras
+import re
 
 SQLITE = 'sqlite'
+POSTGRESQL = 'postgresql'
 
 SUPPORTED_DBS = (
     SQLITE,
+    POSTGRESQL
 )
+
+pattern = "(\w+):?(.*)@(\w+):?(\w*)\/(\w+)"
+
 
 def init_database(uri: str):
     if uri.startswith(SQLITE):
         database = uri.split(':///')[1]
         connection = sqlite3.connect(database=database)
         connection.row_factory = sqlite3.Row
-        return Database(connection=connection, kind=SQLITE)
+        return Database(engine=SQLiteEngine(connection=connection), kind=SQLITE)
+    elif uri.startswith(POSTGRESQL):
+        connection_str = uri.split('://')[1]
+        username, password, host, port, database = re.match(pattern, connection_str).groups()
+        connection = psycopg2.connect(
+            f"dbname={database} user={username} password={password} host={host} port={port}"
+        )
+        return Database(engine=PostgresqlEngine(connection=connection), kind=POSTGRESQL)
     raise ValueError(f"Unsupported uri {str}, supported dbs: {SUPPORTED_DBS}")
+
+
+class Engine:
+    connection = None
+
+    def close(self):
+        raise NotImplementedError()
+
+    def commit(self):
+        raise NotImplementedError()
+
+    def execute(self, query, args):
+        raise NotImplementedError()
+
+
+class SQLiteEngine(Engine):
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def close(self):
+        self.connection.close()
+
+    def commit(self):
+        self.connection.commit()
+
+    def execute(self, query, args):
+        return self.connection.execute(query, args)
+
+
+class PostgresqlEngine(Engine):
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.cur = connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    def close(self):
+        self.cur.close()
+        self.connection.close()
+
+    def commit(self):
+        self.connection.commit()
+
+    def execute(self, query, args):
+        print(query, args)
+        self.cur.execute(query, args)
+        return self.cur
 
 
 class Database:
 
-    def __init__(self, kind: str, connection):
+    def __init__(self, kind: str, engine: Engine):
         self.kind = kind
-        self.connection = connection
+        self.engine = engine
         self.connected = True
         setattr(Model, 'db', self)
 
     def close(self):
         ''' Close SQL connection '''
         if self.connected:
-            self.connection.close()
+            self.engine.close()
         self.connected = False
 
     def commit(self):
         ''' Commit SQL changes '''
-        self.connection.commit()
+        self.engine.commit()
 
     def execute(self, query, *args):
         ''' Execute SQL '''
-        return self.connection.execute(query, args)
+        return self.engine.execute(query, args)
 
 
-class SQLiteDataMapper:
+class DataMapper:
 
     def __init__(self, table_name, db):
         self.table_name = table_name
         self.db = db
 
     def get(self, id) -> Optional[Dict]:
-        query = f"SELECT * FROM {self.table_name} WHERE id = ?"
+        raise NotImplementedError()
+
+    def all(self):
+        raise NotImplementedError()
+
+    def save(self, columns_and_values):
+        raise NotImplementedError()
+
+    def update(self, columns_and_values, id):
+        raise NotImplementedError()
+
+    def delete(self, id):
+        raise NotImplementedError()
+
+
+class SQLDataMapper(DataMapper):
+    placeholder = None
+
+    def get(self, id) -> Optional[Dict]:
+        query = f"SELECT * FROM {self.table_name} WHERE id = {self.placeholder}"
         result = self.db.execute(query, id)
         return result.fetchone()
 
@@ -55,33 +136,44 @@ class SQLiteDataMapper:
         result = self.db.execute(query)
         return result.fetchall()
 
-    def save(self, columns_and_values) -> Any:
+    def save(self, columns_and_values):
         column_names = ", ".join([column for column, _ in columns_and_values])
-        column_refs = ", ".join(["?" for _ in range(len(columns_and_values))])
+        column_refs = ", ".join([self.placeholder for _ in range(len(columns_and_values))])
         query = f"INSERT INTO {self.table_name} ({column_names}) VALUES ({column_refs})"
-        result = self.db.execute(query, *[val for col, val in columns_and_values])
-        return result.lastrowid
+        cur = self.db.execute(query, *[val for col, val in columns_and_values])
+        return cur.lastrowid
 
     def update(self, columns_and_values, id):
         column_names = [column for column, _ in columns_and_values]
-        where_expressions = '= ?, '.join(column_names) + '= ?'
-        query = f'UPDATE {self.table_name} SET {where_expressions} WHERE id = ?'
+        where_expressions = f'= {self.placeholder}, '.join(column_names) + f'= {self.placeholder}'
+        query = f'UPDATE {self.table_name} SET {where_expressions} WHERE id = {self.placeholder}'
         column_values = [val for _, val in columns_and_values] + [id]
-        self.db.execute(query, *column_values)
+        result = self.db.execute(query, *column_values)
+        return result.lastrowid
 
     def delete(self, id):
-        query = f'DELETE from {self.table_name} WHERE id = ?'
+        query = f'DELETE from {self.table_name} WHERE id = {self.placeholder}'
         self.db.execute(query, id)
+
+
+class SQLiteDataMapper(SQLDataMapper):
+    placeholder = '?'
+
+
+class PostgresqlDataMapper(SQLDataMapper):
+    placeholder = '%s'
 
 
 class DataMapperFactory:
 
     @classmethod
     def setup(cls, kind, table_name, db):
+        print(kind)
         if kind == SQLITE:
             return SQLiteDataMapper(table_name, db)
-        else:
-            raise ValueError(f"Unsupported database type {kind}")
+        elif kind == POSTGRESQL:
+            return PostgresqlDataMapper(table_name, db)
+        raise ValueError(f"Unsupported database type {kind}")
 
 
 class Manager:
@@ -92,6 +184,7 @@ class Manager:
     def __init__(self, db: Database, model):
         self.model = model
         self.data_mapper = DataMapperFactory.setup(db.kind, table_name=model._table_name(), db=db)
+        print(self.data_mapper)
 
     def get(self, id):
         row = self.data_mapper.get(id)
